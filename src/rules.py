@@ -4,6 +4,11 @@ TITLE='水库防汛调度与操作确认'; ENTITY='调度指令'; ID_PREFIX='RF'
 SEVERITIES=['routine', 'attention', 'urgent', 'emergency']; STATES=['draft', 'checked', 'authorized', 'executed', 'closed']; TRANSITIONS={'draft': ['checked'], 'checked': ['authorized'], 'authorized': ['executed'], 'executed': ['closed'], 'closed': []}; TRANSITION_ROLES={'checked': ['duty_officer'], 'authorized': ['chief_engineer'], 'executed': ['dispatcher'], 'closed': ['chief_engineer']}
 CREATE_ROLES=set(['duty_officer']); RECORD_ROLES=set(['duty_officer', 'dispatcher']); AUDIT_ROLES=set(['chief_engineer', 'viewer']); VIEW_ROLES=set(['duty_officer', 'chief_engineer', 'dispatcher', 'viewer'])
 SEVERITY_WEIGHT={'routine': 1.0, 'attention': 3.0, 'urgent': 6.0, 'emergency': 9.0}; DEADLINE_HOURS={'routine': 72, 'attention': 24, 'urgent': 8, 'emergency': 4}; TERMINAL_STATES=set(['closed'])
+SECTION_ENTITY='控制断面'; PLAN_ENTITY='联调计划'
+PLAN_STATES=['queued', 'allocated', 'frozen', 'executed']; ACTIVE_PLAN_STATES=set(['allocated', 'executed'])
+SECTION_CREATE_ROLES=set(['dispatcher']); PLAN_REGISTER_ROLES=set(['dispatcher']); PLAN_EXECUTE_ROLES=set(['dispatcher']); REVIEW_ROLES=set(['chief_engineer']); QUEUE_VIEW_ROLES=set(['duty_officer', 'chief_engineer', 'dispatcher', 'viewer'])
+EPSILON=1e-06
+def quota_fits(shared_limit,occupied,planned): return occupied+planned<=shared_limit+EPSILON
 def priority_score(severity,quantity=0.0,threshold=1.0,open_records=0):
     if severity not in SEVERITY_WEIGHT: raise ValidationError("unknown severity")
     ratio=quantity/threshold if threshold>0 else 1.0

@@ -1,1 +1,95 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>水库防汛调度与操作确认</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:#17212b}pre{background:#f4f7f9;padding:1rem;overflow:auto}button{padding:.55rem 1rem}</style></head><body><h1>水库防汛调度与操作确认</h1><p>根据库位、入库流量、下游警戒和施工限制生成复核授权的泄洪指令</p><p>库位超过汛限或入库流量上升时提升紧迫度；授权前必须有复核记录，执行后仍要闭环现场反馈。</p><button onclick="loadItems()">刷新列表</button><pre id="out">使用X-Actor和X-Role请求头调用接口。</pre><script>async function loadItems(){const r=await fetch('/api/items',{headers:{'X-Actor':'demo','X-Role':'viewer'}});document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>水库防汛调度与操作确认</title><style>
+body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:1000px;margin:2rem auto;padding:0 1rem;color:#17212b}
+fieldset{margin:0 0 1rem;border:1px solid #d5dde3;border-radius:6px}
+legend{font-weight:600}
+label{display:inline-block;margin:.25rem .5rem .25rem 0}
+input,select{padding:.35rem}
+button{padding:.45rem .9rem;margin:.25rem .25rem .25rem 0}
+table{border-collapse:collapse;width:100%;margin:.5rem 0}
+th,td{border:1px solid #d5dde3;padding:.35rem .5rem;text-align:left;font-size:.9rem}
+pre{background:#f4f7f9;padding:1rem;overflow:auto;max-height:320px}
+.tag{padding:.1rem .45rem;border-radius:4px;font-size:.8rem;white-space:nowrap}
+.queued{background:#fff3cd}.allocated{background:#d1e7dd}.frozen{background:#f8d7da}.executed{background:#e2e3e5}
+.warn{color:#b02a37;font-weight:600}
+</style></head><body>
+<h1>水库防汛调度与操作确认</h1>
+<p>多库联调排队：调度员登记控制断面与共享安全流量上限，系统按提交顺序为各库计划分配额度；超出上限的计划留在待排队并显示占用额度。执行回填后，偏小释放剩余额度给后续计划，偏大冻结后续计划并交总工复核；执行完的计划不能改写。</p>
+
+<fieldset><legend>身份</legend>
+<label>姓名 <input id="actor" value="调度员甲"></label>
+<label>角色 <select id="role">
+<option value="dispatcher">调度员 dispatcher</option>
+<option value="chief_engineer">总工 chief_engineer</option>
+<option value="duty_officer">值班员 duty_officer</option>
+<option value="viewer">浏览 viewer</option>
+</select></label>
+</fieldset>
+
+<fieldset><legend>1. 登记控制断面（共享安全流量上限）</legend>
+<label>断面名称 <input id="secName" value="沂河控制断面"></label>
+<label>共享上限(m³/s) <input id="secLimit" type="number" value="1000"></label>
+<button onclick="createSection()">登记断面</button>
+<button onclick="loadSections()">刷新断面</button>
+<div id="sections"></div>
+</fieldset>
+
+<fieldset><legend>2. 登记水库下泄计划（按提交顺序分配额度）</legend>
+<label>断面 <select id="planSection"></select></label>
+<label>水库 <input id="reservoir" value="水库A"></label>
+<label>计划下泄量(m³/s) <input id="planned" type="number" value="400"></label>
+<button onclick="registerPlan()">登记计划</button>
+</fieldset>
+
+<fieldset><legend>3. 排队视图</legend>
+<button onclick="loadQueue()">查看排队</button>
+<div id="queue"></div>
+</fieldset>
+
+<fieldset><legend>4. 执行回填 / 总工复核</legend>
+<label>计划ID <input id="planId" type="number"></label>
+<label>实际下泄量(m³/s) <input id="actual" type="number"></label>
+<button onclick="executePlan()">回填执行</button>
+<button onclick="reviewSection()">总工复核并解冻</button>
+</fieldset>
+
+<pre id="out">操作结果将显示在这里。</pre>
+
+<details><summary>原有调度指令列表</summary>
+<button onclick="loadItems()">刷新列表</button>
+<pre id="items"></pre>
+</details>
+
+<script>
+const $=id=>document.getElementById(id);
+const STATUS={queued:'待排队',allocated:'已分配',frozen:'已冻结',executed:'已执行'};
+async function api(path,method,body){
+  const opt={method:method||'GET',headers:{'X-Actor':$('actor').value,'X-Role':$('role').value}};
+  if(body!==undefined){opt.headers['Content-Type']='application/json';opt.body=JSON.stringify(body);}
+  const r=await fetch(path,opt);const data=await r.json().catch(()=>({}));
+  if(!r.ok){$('out').textContent=r.status+' '+JSON.stringify(data,null,2);throw new Error(data.message||r.status);}
+  return data;
+}
+function show(x){$('out').textContent=JSON.stringify(x,null,2);}
+async function createSection(){show(await api('/api/sections','POST',{name:$('secName').value,shared_limit:parseFloat($('secLimit').value)}));await loadSections();}
+async function loadSections(){
+  const d=await api('/api/sections');show(d);
+  $('sections').innerHTML='<table><tr><th>ID</th><th>断面</th><th>共享上限</th><th>已占用</th><th>剩余</th><th>待复核</th></tr>'+
+    d.sections.map(s=>`<tr><td>${s.id}</td><td>${s.name}</td><td>${s.shared_limit}</td><td>${s.occupied}</td><td>${s.remaining}</td><td>${s.review_required?'<span class="warn">是</span>':'否'}</td></tr>`).join('')+'</table>';
+  $('planSection').innerHTML=d.sections.map(s=>`<option value="${s.id}">${s.id} - ${s.name}</option>`).join('');
+}
+async function registerPlan(){show(await api('/api/sections/'+$('planSection').value+'/plans','POST',{reservoir:$('reservoir').value,planned:parseFloat($('planned').value)}));await loadQueue();await loadSections();}
+async function loadQueue(){
+  const sid=$('planSection').value;if(!sid)return;
+  const s=await api('/api/sections/'+sid);show(s);
+  let h=`<p>断面 <b>${s.name}</b>：上限 ${s.shared_limit}，已占用 ${s.occupied}，剩余 ${s.remaining}${s.review_required?'，<span class="warn">等待总工复核</span>':''}</p>`;
+  h+='<table><tr><th>顺序</th><th>计划ID</th><th>水库</th><th>计划下泄</th><th>实际下泄</th><th>偏差</th><th>状态</th><th>前序占用</th><th>缺口</th></tr>';
+  for(const p of s.plans){
+    h+=`<tr><td>${p.seq}</td><td>${p.id}</td><td>${p.reservoir}</td><td>${p.planned}</td><td>${p.actual??''}</td><td>${p.deviation??''}</td><td><span class="tag ${p.status}">${STATUS[p.status]||p.status}</span></td><td>${p.ahead??''}</td><td>${p.shortfall??''}</td></tr>`;
+  }
+  $('queue').innerHTML=h+'</table>';
+}
+async function executePlan(){show(await api('/api/plans/'+$('planId').value+'/execute','POST',{actual:parseFloat($('actual').value)}));await loadQueue();await loadSections();}
+async function reviewSection(){show(await api('/api/sections/'+$('planSection').value+'/review','POST',{}));await loadQueue();await loadSections();}
+async function loadItems(){const d=await api('/api/items');$('items').textContent=JSON.stringify(d,null,2);}
+loadSections().catch(()=>{});
+</script></body></html>

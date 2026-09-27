@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import EPSILON, ID_PREFIX, PLAN_STATES, STATES, quota_fits
 
 
 class Repository:
@@ -24,6 +24,7 @@ class Repository:
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
+        plan_statuses = ",".join("'" + s + "'" for s in PLAN_STATES)
         with self.conn:
             self.conn.executescript(f"""
                 CREATE TABLE IF NOT EXISTS items (
@@ -65,6 +66,37 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS sections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    shared_limit REAL NOT NULL,
+                    review_required INTEGER NOT NULL DEFAULT 0,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    external_ref TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_sections_external_ref
+                    ON sections(external_ref) WHERE external_ref IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    section_id INTEGER NOT NULL REFERENCES sections(id) ON DELETE CASCADE,
+                    reservoir TEXT NOT NULL,
+                    planned REAL NOT NULL,
+                    actual REAL,
+                    seq INTEGER NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ({plan_statuses})),
+                    version INTEGER NOT NULL DEFAULT 1,
+                    external_ref TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    executed_by TEXT,
+                    executed_at TEXT,
+                    UNIQUE(section_id, seq)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_plans_external_ref
+                    ON plans(external_ref) WHERE external_ref IS NOT NULL;
             """)
 
     @staticmethod
@@ -156,6 +188,189 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def create_section(self, name: str, shared_limit: float,
+                       external_ref: Optional[str], actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO sections(name, shared_limit, review_required, version,
+                       external_ref, created_by, created_at, updated_at)
+                       VALUES(?,?,0,1,?,?,?,?)""",
+                    (name, shared_limit, external_ref, actor, now, now),
+                )
+                section_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("external_ref已存在") from exc
+        return self.get_section(section_id)
+
+    def get_section(self, section_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM sections WHERE id=?", (section_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("控制断面不存在")
+        return dict(row)
+
+    def list_sections(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute("SELECT * FROM sections ORDER BY id").fetchall()
+        return [dict(row) for row in rows]
+
+    def _occupied_locked(self, section_id: int) -> float:
+        row = self.conn.execute(
+            """SELECT COALESCE(SUM(CASE WHEN status='allocated' THEN planned
+                   WHEN status='executed' THEN actual ELSE 0 END),0) AS used
+               FROM plans WHERE section_id=?""",
+            (section_id,),
+        ).fetchone()
+        return float(row["used"])
+
+    def section_occupied(self, section_id: int) -> float:
+        with self._lock:
+            return self._occupied_locked(section_id)
+
+    def create_plan(self, section_id: int, reservoir: str, planned: float,
+                    external_ref: Optional[str], actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            section = self.conn.execute(
+                "SELECT * FROM sections WHERE id=?", (section_id,)).fetchone()
+            if section is None:
+                raise NotFoundError("控制断面不存在")
+            row = self.conn.execute(
+                "SELECT COALESCE(MAX(seq),0) AS m FROM plans WHERE section_id=?",
+                (section_id,)).fetchone()
+            seq = int(row["m"]) + 1
+            blocked = self.conn.execute(
+                """SELECT 1 FROM plans WHERE section_id=? AND status IN ('queued','frozen')
+                   LIMIT 1""",
+                (section_id,),
+            ).fetchone() is not None
+            occupied = self._occupied_locked(section_id)
+            fits = quota_fits(float(section["shared_limit"]), occupied, planned)
+            status = "allocated" if not blocked and fits else "queued"
+            try:
+                cur = self.conn.execute(
+                    """INSERT INTO plans(section_id, reservoir, planned, actual, seq, status,
+                       version, external_ref, created_by, created_at)
+                       VALUES(?,?,?,NULL,?,?,1,?,?,?)""",
+                    (section_id, reservoir, planned, seq, status, external_ref, actor, now),
+                )
+                plan_id = int(cur.lastrowid)
+            except sqlite3.IntegrityError as exc:
+                raise ConflictError("external_ref已存在") from exc
+            row = self.conn.execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
+        return dict(row)
+
+    def get_plan(self, plan_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("计划不存在")
+        return dict(row)
+
+    def list_plans(self, section_id: int) -> List[Dict[str, Any]]:
+        self.get_section(section_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM plans WHERE section_id=? ORDER BY seq", (section_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _promote_locked(self, section_id: int, shared_limit: float) -> List[int]:
+        promoted: List[int] = []
+        occupied = self._occupied_locked(section_id)
+        rows = self.conn.execute(
+            """SELECT * FROM plans WHERE section_id=? AND status='queued' ORDER BY seq""",
+            (section_id,),
+        ).fetchall()
+        for row in rows:
+            planned = float(row["planned"])
+            if not quota_fits(shared_limit, occupied, planned):
+                break
+            self.conn.execute(
+                "UPDATE plans SET status='allocated', version=version+1 WHERE id=?",
+                (row["id"],),
+            )
+            occupied += planned
+            promoted.append(int(row["id"]))
+        return promoted
+
+    def execute_plan(self, plan_id: int, actual: float, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("计划不存在")
+            plan = dict(row)
+            if plan["status"] == "executed":
+                raise ConflictError("计划已执行完成，不能改写")
+            if plan["status"] != "allocated":
+                raise ConflictError("计划未持有额度，不能回填执行")
+            section = self.conn.execute(
+                "SELECT * FROM sections WHERE id=?", (plan["section_id"],)).fetchone()
+            planned = float(plan["planned"])
+            self.conn.execute(
+                """UPDATE plans SET status='executed', actual=?, executed_by=?,
+                   executed_at=?, version=version+1 WHERE id=?""",
+                (actual, actor, now, plan_id),
+            )
+            promoted: List[int] = []
+            frozen: List[int] = []
+            if actual > planned + EPSILON:
+                self.conn.execute(
+                    """UPDATE plans SET status='frozen', version=version+1
+                       WHERE section_id=? AND status IN ('allocated','queued')""",
+                    (plan["section_id"],),
+                )
+                frozen = [int(r["id"]) for r in self.conn.execute(
+                    """SELECT id FROM plans WHERE section_id=? AND status='frozen'
+                       ORDER BY seq""",
+                    (plan["section_id"],),
+                ).fetchall()]
+                self.conn.execute(
+                    """UPDATE sections SET review_required=1, version=version+1,
+                       updated_at=? WHERE id=?""",
+                    (now, plan["section_id"]),
+                )
+            else:
+                promoted = self._promote_locked(
+                    plan["section_id"], float(section["shared_limit"]))
+            updated = self.conn.execute(
+                "SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
+        return {
+            "plan": dict(updated), "promoted": promoted, "frozen": frozen,
+            "released": max(0.0, planned - actual), "over": max(0.0, actual - planned),
+        }
+
+    def review_section(self, section_id: int, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            section = self.conn.execute(
+                "SELECT * FROM sections WHERE id=?", (section_id,)).fetchone()
+            if section is None:
+                raise NotFoundError("控制断面不存在")
+            if int(section["review_required"]) != 1:
+                raise ConflictError("断面当前无需复核")
+            restored = [int(r["id"]) for r in self.conn.execute(
+                """SELECT id FROM plans WHERE section_id=? AND status='frozen'
+                   ORDER BY seq""",
+                (section_id,),
+            ).fetchall()]
+            self.conn.execute(
+                """UPDATE plans SET status='queued', version=version+1
+                   WHERE section_id=? AND status='frozen'""",
+                (section_id,),
+            )
+            self.conn.execute(
+                """UPDATE sections SET review_required=0, version=version+1,
+                   updated_at=? WHERE id=?""",
+                (now, section_id),
+            )
+            promoted = self._promote_locked(section_id, float(section["shared_limit"]))
+        return {"restored": restored, "promoted": promoted}
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

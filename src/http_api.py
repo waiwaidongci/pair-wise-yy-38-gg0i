@@ -98,6 +98,15 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"events": service.audit(role)})
+                elif path == "/api/sections":
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"sections": service.list_sections(role)})
+                elif path.startswith("/api/sections/"):
+                    section_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.get_section_queue(section_id, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -119,6 +128,17 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif path == "/api/sections":
+                    self._json(201, service.create_section(body, actor, role))
+                elif path.startswith("/api/sections/") and path.endswith("/plans"):
+                    section_id = int(path.split("/")[3])
+                    self._json(201, service.register_plan(section_id, body, actor, role))
+                elif path.startswith("/api/sections/") and path.endswith("/review"):
+                    section_id = int(path.split("/")[3])
+                    self._json(200, service.review_section(section_id, actor, role))
+                elif path.startswith("/api/plans/") and path.endswith("/execute"):
+                    plan_id = int(path.split("/")[3])
+                    self._json(200, service.execute_plan(plan_id, body, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
