@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
+from .queueing import (ALLOCATED, EXECUTED, FROZEN, PLAN_STATUSES, WAITING)
 from .rules import ID_PREFIX, STATES
 
 
@@ -24,6 +25,7 @@ class Repository:
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
+        plan_statuses = ",".join("'" + s + "'" for s in PLAN_STATUSES)
         with self.conn:
             self.conn.executescript(f"""
                 CREATE TABLE IF NOT EXISTS items (
@@ -65,6 +67,33 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS queue_sections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    shared_cap REAL NOT NULL,
+                    frozen INTEGER NOT NULL DEFAULT 0,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS queue_plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    section_id INTEGER NOT NULL REFERENCES queue_sections(id) ON DELETE CASCADE,
+                    seq INTEGER NOT NULL,
+                    reservoir TEXT NOT NULL,
+                    planned REAL NOT NULL,
+                    actual REAL,
+                    status TEXT NOT NULL DEFAULT '{WAITING}'
+                        CHECK(status IN ({plan_statuses})),
+                    executed_at TEXT,
+                    executed_by TEXT,
+                    reviewed_at TEXT,
+                    reviewed_by TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(section_id, seq)
+                );
+                CREATE INDEX IF NOT EXISTS ix_queue_plans_section
+                    ON queue_plans(section_id, seq);
             """)
 
     @staticmethod
@@ -209,6 +238,170 @@ class Repository:
                 return False
             previous = row["entry_hash"]
         return True
+
+    # ----- 联调排队 -----
+
+    def create_section(self, name: str, shared_cap: float,
+                       actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO queue_sections(name, shared_cap, created_by, created_at)
+                       VALUES(?,?,?,?)""",
+                    (name, shared_cap, actor, now),
+                )
+                section_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("控制断面名称已存在") from exc
+        return self.get_section(section_id)
+
+    def get_section(self, section_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM queue_sections WHERE id=?", (section_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("控制断面不存在")
+        return dict(row)
+
+    def list_sections(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM queue_sections ORDER BY id"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_plan(self, section_id: int, reservoir: str, planned: float,
+                    actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT COALESCE(MAX(seq),0) AS last_seq FROM queue_plans WHERE section_id=?",
+                (section_id,),
+            ).fetchone()
+            seq = int(row["last_seq"]) + 1
+            cur = self.conn.execute(
+                """INSERT INTO queue_plans(section_id, seq, reservoir, planned, status,
+                   created_by, created_at) VALUES(?,?,?,?,?,?,?)""",
+                (section_id, seq, reservoir, planned, WAITING, actor, now),
+            )
+            plan_id = int(cur.lastrowid)
+        return self.get_plan(plan_id)
+
+    def get_plan(self, plan_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM queue_plans WHERE id=?", (plan_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("联调计划不存在")
+        return dict(row)
+
+    def list_plans(self, section_id: int) -> List[Dict[str, Any]]:
+        self.get_section(section_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM queue_plans WHERE section_id=? ORDER BY seq",
+                (section_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_plan_status(self, plan_id: int, statuses: tuple,
+                           status: str) -> None:
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE queue_plans SET status=? WHERE id=? AND status IN (%s)"
+                % ",".join("?" for _ in statuses),
+                (status, plan_id, *statuses),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM queue_plans WHERE id=?", (plan_id,)
+                ).fetchone()
+                if exists is None:
+                    raise NotFoundError("联调计划不存在")
+                current = self.conn.execute(
+                    "SELECT status FROM queue_plans WHERE id=?", (plan_id,)
+                ).fetchone()
+                raise ConflictError(f"计划当前状态为{current['status']}，不能改为{status}")
+
+    def mark_plan_executed(self, plan_id: int, actual: float,
+                           actor: str) -> None:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE queue_plans SET status=?, actual=?, executed_at=?, executed_by=?
+                   WHERE id=? AND status=?""",
+                (EXECUTED, actual, now, actor, plan_id, ALLOCATED),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM queue_plans WHERE id=?", (plan_id,)
+                ).fetchone()
+                if exists is None:
+                    raise NotFoundError("联调计划不存在")
+                current = self.conn.execute(
+                    "SELECT status FROM queue_plans WHERE id=?", (plan_id,)
+                ).fetchone()
+                raise ConflictError(
+                    f"计划当前状态为{current['status']}，无法回填"
+                    if current["status"] == EXECUTED else "只有已分配的计划可以回填执行结果")
+
+    def freeze_later_plans(self, section_id: int, seq: int) -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                """UPDATE queue_plans SET status=?
+                   WHERE section_id=? AND seq>? AND status IN (?,?)""",
+                (FROZEN, section_id, seq, WAITING, ALLOCATED),
+            )
+            self.conn.execute(
+                "UPDATE queue_sections SET frozen=1 WHERE id=?", (section_id,)
+            )
+
+    def mark_plans_allocated(self, plan_ids: List[int]) -> None:
+        if not plan_ids:
+            return
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE queue_plans SET status=? WHERE id IN (%s)"
+                % ",".join("?" for _ in plan_ids),
+                (ALLOCATED, *plan_ids),
+            )
+
+    def review_plan(self, plan_id: int, status: str, actor: str) -> None:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE queue_plans SET status=?, reviewed_at=?, reviewed_by=?
+                   WHERE id=? AND status=?""",
+                (status, now, actor, plan_id, FROZEN),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM queue_plans WHERE id=?", (plan_id,)
+                ).fetchone()
+                if exists is None:
+                    raise NotFoundError("联调计划不存在")
+                current = self.conn.execute(
+                    "SELECT status FROM queue_plans WHERE id=?", (plan_id,)
+                ).fetchone()
+                raise ConflictError(
+                    f"计划当前状态为{current['status']}，只有冻结计划可复核")
+
+    def section_has_frozen(self, section_id: int) -> bool:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM queue_plans WHERE section_id=? AND status=?",
+                (section_id, FROZEN),
+            ).fetchone()
+        return int(row["n"]) > 0
+
+    def clear_section_frozen(self, section_id: int) -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE queue_sections SET frozen=0 WHERE id=?", (section_id,)
+            )
 
     def close(self) -> None:
         with self._lock:

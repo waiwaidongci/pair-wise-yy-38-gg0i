@@ -1,1 +1,144 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>水库防汛调度与操作确认</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:#17212b}pre{background:#f4f7f9;padding:1rem;overflow:auto}button{padding:.55rem 1rem}</style></head><body><h1>水库防汛调度与操作确认</h1><p>根据库位、入库流量、下游警戒和施工限制生成复核授权的泄洪指令</p><p>库位超过汛限或入库流量上升时提升紧迫度；授权前必须有复核记录，执行后仍要闭环现场反馈。</p><button onclick="loadItems()">刷新列表</button><pre id="out">使用X-Actor和X-Role请求头调用接口。</pre><script>async function loadItems(){const r=await fetch('/api/items',{headers:{'X-Actor':'demo','X-Role':'viewer'}});document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>水库联调排队与泄洪复核</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:1000px;margin:1.5rem auto;padding:0 1rem;color:#17212b;background:#f7f9fb}
+h1{font-size:1.35rem} h2{font-size:1.1rem;margin-top:1.6rem;border-bottom:2px solid #d7e0e8;padding-bottom:.3rem}
+.card{background:#fff;border:1px solid #dde4ea;border-radius:8px;padding:1rem 1.2rem;margin:.8rem 0}
+.bar{display:flex;gap:.6rem;flex-wrap:wrap;align-items:end}
+label{font-size:.85rem;color:#445} input,select{padding:.45rem .5rem;border:1px solid #c4cdd6;border-radius:5px;font-size:.9rem}
+button{padding:.45rem .9rem;border:0;border-radius:5px;background:#2563eb;color:#fff;cursor:pointer;font-size:.85rem}
+button.ghost{background:#e8edf3;color:#253041} button.warn{background:#b45309} button.ok{background:#15803d}
+button:disabled{background:#c3cbd4;cursor:not-allowed}
+table{border-collapse:collapse;width:100%;font-size:.86rem;margin-top:.6rem}
+th,td{border:1px solid #e0e6ec;padding:.45rem .55rem;text-align:left} th{background:#f0f4f8}
+.tag{display:inline-block;padding:.1rem .55rem;border-radius:99px;font-size:.78rem;color:#fff}
+.s-waiting{background:#6b7280}.s-allocated{background:#2563eb}.s-executed{background:#15803d}
+.s-frozen{background:#b91c1c}.s-rejected{background:#52525b}
+.muted{color:#6b7785;font-size:.82rem} .alert{background:#fef2f2;border:1px solid #fca5a5;color:#991b1b;padding:.6rem .9rem;border-radius:6px}
+.okbox{background:#f0fdf4;border:1px solid #86efac;color:#166534;padding:.6rem .9rem;border-radius:6px}
+#msg{min-height:1.2rem;font-size:.85rem;margin:.5rem 0}
+.progress{height:10px;background:#e8edf3;border-radius:6px;overflow:hidden;margin-top:.4rem}
+.progress>div{height:100%;background:#2563eb} .progress.over>div{background:#b91c1c}
+</style>
+</head>
+<body>
+<h1>上游水库腾库 · 共享安全流量联调排队</h1>
+<p class="muted">调度员登记控制断面与共享上限，各库计划下泄量按提交顺序分配额度；偏小释放余量递补，偏大冻结后续计划交总工复核；已执行计划不可改写。</p>
+
+<div class="card bar">
+  <div><label>身份 X-Actor</label><br><input id="actor" value="dispatcher-zhang" style="width:150px"></div>
+  <div><label>角色 X-Role</label><br>
+    <select id="role">
+      <option value="dispatcher">dispatcher 调度员</option>
+      <option value="chief_engineer">chief_engineer 总工</option>
+      <option value="duty_officer">duty_officer 值班员</option>
+      <option value="viewer">viewer 观察员</option>
+    </select>
+  </div>
+  <button class="ghost" onclick="loadSections()">刷新排队</button>
+</div>
+<div id="msg"></div>
+
+<div class="card">
+  <h2 style="margin-top:0">1. 登记控制断面</h2>
+  <div class="bar">
+    <div><label>控制断面名称</label><br><input id="sec_name" placeholder="如：城关水文站" style="width:180px"></div>
+    <div><label>共享安全上限 (m³/s)</label><br><input id="sec_cap" type="number" step="0.01" min="0" placeholder="如 1000" style="width:170px"></div>
+    <button onclick="createSection()">登记断面</button>
+  </div>
+</div>
+
+<div id="sections"></div>
+
+<script>
+const STATUS_TEXT={waiting:'待排队',allocated:'已分配',executed:'已执行',frozen:'已冻结',rejected:'已驳回'};
+function $(id){return document.getElementById(id)}
+async function api(path,opts={}){
+  opts.headers=Object.assign({'Content-Type':'application/json','X-Actor':$('actor').value||'demo','X-Role':$('role').value},opts.headers||{});
+  const r=await fetch(path,opts); const data=await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(data.message||('HTTP '+r.status));
+  return data;
+}
+function msg(text,ok){const el=$('msg');el.textContent=text||'';el.className=ok?'okbox':(text?'alert':'');}
+function fmt(n){return Number(n).toFixed(2).replace(/\.00$/,'')}
+
+async function createSection(){
+  try{
+    await api('/api/queue/sections',{method:'POST',body:JSON.stringify({name:$('sec_name').value,shared_cap:Number($('sec_cap').value)})});
+    $('sec_name').value='';$('sec_cap').value='';msg('控制断面已登记',true);loadSections();
+  }catch(e){msg(e.message)}
+}
+
+async function addPlan(sectionId){
+  try{
+    await api(`/api/queue/sections/${sectionId}/plans`,{method:'POST',body:JSON.stringify({
+      reservoir:$(`r_${sectionId}`).value, planned:Number($(`p_${sectionId}`).value)})});
+    $(`r_${sectionId}`).value='';$(`p_${sectionId}`).value='';msg('计划已登记并按顺序参与排队',true);loadSections();
+  }catch(e){msg(e.message)}
+}
+
+async function executePlan(planId){
+  const v=window.prompt('回填实际下泄量 (m³/s)：'); if(v===null)return;
+  try{
+    const data=await api(`/api/queue/plans/${planId}/execute`,{method:'POST',body:JSON.stringify({actual:Number(v)})});
+    const over=data.plans.find(p=>p.id===planId&&p.actual>p.planned+1e-9);
+    msg(over?'实际下泄偏大，后续计划已冻结，交总工复核':'实际下泄量已回填，剩余额度已释放给后续计划',!over);
+    loadSections();
+  }catch(e){msg(e.message)}
+}
+
+async function reviewPlan(planId,decision){
+  const note=window.prompt(decision==='approve'?'总工复核：放行该冻结计划（可附意见，留空跳过）':'总工复核：驳回该冻结计划（可附意见，留空跳过）：');
+  if(note===null)return;
+  try{
+    await api(`/api/queue/plans/${planId}/review`,{method:'POST',body:JSON.stringify({decision,note:note||undefined})});
+    msg('复核意见已提交',true);loadSections();
+  }catch(e){msg(e.message)}
+}
+
+function planRow(s,p){
+  const occ=p.status==='executed'&&p.actual!=null?p.actual:(p.status==='allocated'?p.planned:0);
+  let action='';
+  if(p.status==='allocated') action=`<button class="ok" onclick="executePlan(${p.id})">回填实际下泄</button>`;
+  else if(p.status==='frozen') action=`<button class="ok" onclick="reviewPlan(${p.id},'approve')">总工放行</button> <button class="warn" onclick="reviewPlan(${p.id},'reject')">驳回</button>`;
+  else if(p.status==='executed') action='<span class="muted">不可改写</span>';
+  const actual=p.actual!=null?fmt(p.actual)+(p.actual>p.planned+1e-9?' <b style="color:#b91c1c">超泄</b>':(p.actual<p.planned-1e-9?' <span class="muted">余量已释放</span>':'')):'—';
+  return `<tr><td>${p.seq}</td><td>${p.reservoir}</td><td>${fmt(p.planned)}</td>
+    <td><span class="tag s-${p.status}">${STATUS_TEXT[p.status]}</span></td>
+    <td>${fmt(occ)}</td><td>${actual}</td><td>${action}</td></tr>`;
+}
+
+async function loadSections(){
+  try{
+    const data=await api('/api/queue/sections');
+    if(!data.sections.length){$('sections').innerHTML='<p class="muted">尚无控制断面，请先登记。</p>';return;}
+    const details=await Promise.all(data.sections.map(s=>api(`/api/queue/sections/${s.id}`)));
+    $('sections').innerHTML=details.map(s=>{
+      const pct=Math.max(0,Math.min(150,s.occupied/s.shared_cap*100));
+      const over=s.occupied>s.shared_cap+1e-9;
+      return `<div class="card">
+        <h2 style="margin-top:0">断面 #${s.id} ${s.name}
+          <span class="muted">共享上限 ${fmt(s.shared_cap)} · 已占用 ${fmt(s.occupied)} · 剩余 ${fmt(s.remaining)}</span></h2>
+        ${s.frozen?'<div class="alert">该断面存在超泄冻结，后续计划已暂停，等待总工逐条复核。</div>':''}
+        <div class="progress ${over?'over':''}"><div style="width:${Math.min(100,pct)}%"></div></div>
+        <table><thead><tr><th>#</th><th>水库</th><th>计划下泄</th><th>状态</th><th>占用额度</th><th>实际下泄</th><th>操作</th></tr></thead>
+        <tbody>${s.plans.map(p=>planRow(s,p)).join('')||'<tr><td colspan="7" class="muted">尚无计划</td></tr>'}</tbody></table>
+        <div class="bar" style="margin-top:.7rem">
+          <div><label>水库名称</label><br><input id="r_${s.id}" placeholder="如：青峰山水库" style="width:160px"></div>
+          <div><label>计划下泄量 (m³/s)</label><br><input id="p_${s.id}" type="number" step="0.01" min="0" style="width:160px"></div>
+          <button onclick="addPlan(${s.id})">登记计划并入队</button>
+        </div>
+        <p class="muted">排队统计：待排队 ${s.counts.waiting} · 已分配 ${s.counts.allocated} · 已执行 ${s.counts.executed} · 已冻结 ${s.counts.frozen} · 已驳回 ${s.counts.rejected}</p>
+      </div>`;
+    }).join('');
+    msg('',true);
+  }catch(e){msg(e.message)}
+}
+loadSections();
+</script>
+</body>
+</html>

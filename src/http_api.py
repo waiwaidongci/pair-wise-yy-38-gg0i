@@ -98,6 +98,15 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"events": service.audit(role)})
+                elif path == "/api/queue/sections":
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"sections": service.list_sections(role)})
+                elif path.startswith("/api/queue/sections/"):
+                    section_id = int(path.rsplit("/", 1)[-1])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.section_view(section_id, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -110,6 +119,17 @@ def make_handler(service: Service, static_dir: str):
                 body = self._body()
                 if path == "/api/items":
                     self._json(201, service.create_item(body, actor, role))
+                elif path == "/api/queue/sections":
+                    self._json(201, service.register_section(body, actor, role))
+                elif path.startswith("/api/queue/sections/") and path.endswith("/plans"):
+                    section_id = int(path.split("/")[4])
+                    self._json(201, service.register_plan(section_id, body, actor, role))
+                elif path.startswith("/api/queue/plans/") and path.endswith("/execute"):
+                    plan_id = int(path.split("/")[4])
+                    self._json(200, service.execute_plan(plan_id, body, actor, role))
+                elif path.startswith("/api/queue/plans/") and path.endswith("/review"):
+                    plan_id = int(path.split("/")[4])
+                    self._json(200, service.review_plan(plan_id, body, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))

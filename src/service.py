@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import threading
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ConflictError, ValidationError, ensure_role,
+                     normalize_severity, require_number, require_text)
+from .queueing import (ALLOCATED, EXECUTE_ROLES, EXECUTED, PLAN_ENTITY,
+                       QUEUE_VIEW_ROLES, REGISTER_PLAN_ROLES,
+                       REGISTER_SECTION_ROLES, REVIEW_DECISIONS, REVIEW_ROLES,
+                       REJECTED, SECTION_ENTITY, is_over_discharge,
+                       occupied_quota, reallocate)
 from .repository import Repository
 from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
                     VIEW_ROLES, completion_blockers, escalation_required,
@@ -13,6 +20,7 @@ from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
 class Service:
     def __init__(self, repository: Repository):
         self.repository = repository
+        self._queue_lock = threading.RLock()
 
     def _view(self, role: str) -> None:
         ensure_role(role, VIEW_ROLES)
@@ -90,6 +98,136 @@ class Service:
     def audit(self, role: str, item_id: Optional[int] = None) -> list:
         ensure_role(role, AUDIT_ROLES)
         return self.repository.list_audit(item_id)
+
+    # ----- 联调排队 -----
+
+    def register_section(self, payload: Dict[str, Any], actor: str,
+                         role: str) -> Dict[str, Any]:
+        ensure_role(role, REGISTER_SECTION_ROLES)
+        actor = require_text(actor, "actor", 100)
+        name = require_text(payload.get("name"), "name", 100)
+        shared_cap = require_number(payload.get("shared_cap"), "shared_cap", 0.0)
+        if shared_cap <= 0:
+            raise ValidationError("shared_cap必须大于0")
+        with self._queue_lock:
+            section = self.repository.create_section(name, shared_cap, actor)
+            self.repository.append_audit(
+                "register_section", SECTION_ENTITY, section["id"], actor,
+                {"name": name, "shared_cap": shared_cap})
+            return self.section_view(section["id"], role)
+
+    def register_plan(self, section_id: int, payload: Dict[str, Any],
+                      actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, REGISTER_PLAN_ROLES)
+        actor = require_text(actor, "actor", 100)
+        reservoir = require_text(payload.get("reservoir"), "reservoir", 100)
+        planned = require_number(payload.get("planned"), "planned", 0.0)
+        if planned <= 0:
+            raise ValidationError("planned必须大于0")
+        with self._queue_lock:
+            section = self.repository.get_section(section_id)
+            plan = self.repository.create_plan(section_id, reservoir, planned, actor)
+            if not section["frozen"]:
+                self._promote_waiting(section_id)
+            self.repository.append_audit(
+                "register_plan", PLAN_ENTITY, plan["id"], actor,
+                {"section_id": section_id, "seq": plan["seq"],
+                 "reservoir": reservoir, "planned": planned,
+                 "status_after": self.repository.get_plan(plan["id"])["status"]})
+            return self.section_view(section_id, role)
+
+    def execute_plan(self, plan_id: int, payload: Dict[str, Any],
+                     actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, EXECUTE_ROLES)
+        actor = require_text(actor, "actor", 100)
+        actual = require_number(payload.get("actual"), "actual", 0.0)
+        with self._queue_lock:
+            plan = self.repository.get_plan(plan_id)
+            if plan["status"] == EXECUTED:
+                raise ConflictError("计划已执行并回填，不能改写")
+            section_id = plan["section_id"]
+            self.repository.mark_plan_executed(plan_id, actual, actor)
+            over = is_over_discharge(plan["planned"], actual)
+            if over:
+                # 偏大：冻结后续计划，交总工复核，不做再分配
+                self.repository.freeze_later_plans(section_id, plan["seq"])
+            else:
+                # 偏小或持平：释放剩余额度给后续待排队计划
+                self._promote_waiting(section_id)
+            self.repository.append_audit(
+                "execute_plan", PLAN_ENTITY, plan_id, actor,
+                {"section_id": section_id, "planned": plan["planned"],
+                 "actual": actual, "over_discharge": over,
+                 "released": max(0.0, plan["planned"] - actual)})
+            return self.section_view(section_id, role)
+
+    def review_plan(self, plan_id: int, payload: Dict[str, Any],
+                    actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, REVIEW_ROLES)
+        actor = require_text(actor, "actor", 100)
+        decision = payload.get("decision")
+        if decision not in REVIEW_DECISIONS:
+            raise ValidationError("decision必须是approve或reject")
+        note = payload.get("note")
+        if note is not None:
+            note = require_text(note, "note", 2000)
+        with self._queue_lock:
+            plan = self.repository.get_plan(plan_id)
+            section_id = plan["section_id"]
+            new_status = ALLOCATED if decision == "approve" else REJECTED
+            self.repository.review_plan(plan_id, new_status, actor)
+            promoted = []
+            if not self.repository.section_has_frozen(section_id):
+                self.repository.clear_section_frozen(section_id)
+                promoted = self._promote_waiting(section_id)
+            self.repository.append_audit(
+                "review_plan", PLAN_ENTITY, plan_id, actor,
+                {"section_id": section_id, "decision": decision,
+                 "note": note, "promoted": promoted})
+            return self.section_view(section_id, role)
+
+    def list_sections(self, role: str) -> list:
+        ensure_role(role, QUEUE_VIEW_ROLES)
+        return [self._section_summary(section)
+                for section in self.repository.list_sections()]
+
+    def section_view(self, section_id: int, role: str) -> Dict[str, Any]:
+        ensure_role(role, QUEUE_VIEW_ROLES)
+        section = self.repository.get_section(section_id)
+        plans = self.repository.list_plans(section_id)
+        result = self._section_summary(section)
+        result["plans"] = [self._plan_view(plan) for plan in plans]
+        return result
+
+    def _promote_waiting(self, section_id: int) -> list:
+        """按提交顺序把装得下的待排队计划提升为已分配，返回提升的计划id。"""
+        section = self.repository.get_section(section_id)
+        plans = self.repository.list_plans(section_id)
+        promotions = reallocate(plans, section["shared_cap"])
+        self.repository.mark_plans_allocated(promotions)
+        return promotions
+
+    def _section_summary(self, section: Dict[str, Any]) -> Dict[str, Any]:
+        plans = self.repository.list_plans(section["id"])
+        occupied = occupied_quota(plans)
+        result = dict(section)
+        result["frozen"] = bool(section["frozen"])
+        result["occupied"] = round(occupied, 9)
+        result["remaining"] = round(float(section["shared_cap"]) - occupied, 9)
+        counts = {status: 0 for status in
+                  ("waiting", "allocated", "executed", "frozen", "rejected")}
+        for plan in plans:
+            counts[plan["status"]] += 1
+        result["counts"] = counts
+        return result
+
+    @staticmethod
+    def _plan_view(plan: Dict[str, Any]) -> Dict[str, Any]:
+        result = dict(plan)
+        result["planned"] = float(plan["planned"])
+        if plan.get("actual") is not None:
+            result["actual"] = float(plan["actual"])
+        return result
 
     @staticmethod
     def enrich(item: Dict[str, Any]) -> Dict[str, Any]:
